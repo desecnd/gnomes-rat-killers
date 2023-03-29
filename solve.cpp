@@ -118,7 +118,7 @@ public:
 			float seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 
 
-			if (state == GNOME_STATE_RESTING && requester && seconds > req_interval_s + tid) {
+			if (state == GNOME_STATE_RESTING && requester && seconds > req_interval_s) {
 				request_resource((GNOME_TYPE_KILLER ? RESOURCE_TYPE_GUN : RESOURCE_TYPE_PIN_SCOPE));
 				std::cerr << get_debug_prefix() << "starting REQUEST state!" << std::endl;
 				last_start = std::chrono::system_clock::now();
@@ -183,9 +183,19 @@ private:
 				} 
 				
 				if (!msg_set.empty()) {
+					// TODO: send ACK if not sent?
+					// 
+
 					auto first_it = msg_set.begin();
+					
+					bool sent_ack = false;
+					if (!first_it->sent_ack) {
+						send_ack(first_it->proc_id, first_it->resource_type);
+						sent_ack = true;
+					}
+
 					msg_set.erase(first_it);
-					std::cerr << get_debug_prefix() << "Received RELEASE from other group: erasing " << gm.proc_id << ", " << gm.lamport_timestamp << std::endl;
+					std::cerr << get_debug_prefix() << "Received RELEASE from other group: erasing (" << gm.proc_id << ", " << gm.lamport_timestamp << ") - sent_ack? " << sent_ack << std::endl;
 				} else {
 					std::cerr << get_debug_prefix() << "Received RELEASE from other group: but set empty []" << std::endl;
 				}
