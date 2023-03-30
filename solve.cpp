@@ -11,118 +11,323 @@
 #include <sstream>
 #include <numeric>
 #include <functional>
+#include <thread>
+#include <map>
 
 // TODO: move to arguments 
 #define N_WORKERS 	2 // Skrzaty
-#define N_KILLERS 	2 // Gnomy
-#define N_PINS 		1 // Agrafki
+#define N_KILLERS 	1 // Gnomy
+#define N_PINS 		2 // Agrafki
 #define N_SCOPES 	0 // Celowniki
 					  // 
 #define GNOME_MESSAGE_TAG 123
 		
 enum {
-	MESSAGE_TYPE_REQUEST = 1,
+	MESSAGE_TYPE_NONE = -1,
+	MESSAGE_TYPE_REQUEST,
 	MESSAGE_TYPE_ACK,
-	MESSAGE_TYPE_RELEASE,
+	MESSAGE_TYPE_CONSUME,
+	MESSAGE_TYPE_PRODUCE,
+	MESSAGE_TYPE_N,
 };
 
 enum { 
-	RESOURCE_TYPE_PIN_SCOPE = 0,
+	RESOURCE_TYPE_NONE = -1,
+	RESOURCE_TYPE_PIN_SCOPE,
 	// RESOURCE_TYPE_SCOPE,
-	RESOURCE_TYPE_GUN = 1,
-	RESOURCE_TYPE_N = 2,
+	RESOURCE_TYPE_WEAPON,
+	RESOURCE_TYPE_N,
 };
 
 enum {
-	GNOME_STATE_RESTING = 0,
+	GNOME_STATE_NONE = -1,
+	GNOME_STATE_SLEEPING,
+	GNOME_STATE_RESTING,
 	GNOME_STATE_REQUESTING, 
+	GNOME_STATE_INSECTION,
+	GNOME_STATE_N,
 };
 
 enum {
-	GNOME_TYPE_NONE = 0,
-	GNOME_TYPE_WORKER = 100,
-	GNOME_TYPE_KILLER = 200,
+	GNOME_TYPE_NONE = -1,
+	GNOME_TYPE_WORKER,
+	GNOME_TYPE_KILLER,
+};
+
+
+// Assumes one resource
+class GnomeResourceQueue { 
+
+	struct GnomeQueueEntry {
+		int gnome_id, lamport_timestamp;
+	};
+	
+	struct GnomeQueueEntryComparator {
+    	bool operator() (GnomeQueueEntry lhs, GnomeQueueEntry rhs) const {
+			if (lhs.lamport_timestamp != rhs.lamport_timestamp) return lhs.lamport_timestamp < rhs.lamport_timestamp;
+			else return lhs.gnome_id < rhs.gnome_id;
+		}
+	};
+	
+	int resource_cnt = 0;
+	std::map<int, bool> ack_sent;
+
+	std::set<GnomeQueueEntry, GnomeQueueEntryComparator> req_queue;
+public:
+	
+	void init(const std::vector<int>& gnome_ids, int n_resources) {
+		resource_cnt = n_resources;
+		for (auto id : gnome_ids) {
+			ack_sent[id] = false;
+		}
+	}
+	
+	
+	// REQUEST received -> possible sending ACK 
+	// - check if entry is in ack window [0, <resource_cnt>)
+	// - * if yes: mark send ack
+	void add_request(int gnome_id, int lamport, bool& should_send_ack, int& ack_gnome_id) {
+		GnomeQueueEntry entry = { gnome_id, lamport };
+
+		// make sure request does not exist
+		assert(req_queue.find(entry) == req_queue.end());
+
+		// returns iterator to inserted element, and true if succeeded
+		auto p = req_queue.insert(entry); 
+		int idx = std::distance(req_queue.begin(), p.first);
+
+		// new request in ACK window
+		if (idx < resource_cnt) {
+			should_send_ack = true;
+			ack_gnome_id = gnome_id;
+		} else {
+			should_send_ack = false;
+		}
+	}
+
+	// CONSUME resource -> remove request, no option in sending ACK
+	// - remove entry from Queue
+	// - set ack_sent to false for this gnome
+	// - decrement resource
+	void consume_resource(int gnome_id, int lamport) {
+		auto entry_it = req_queue.begin();
+		while (entry_it != req_queue.end() && entry_it->gnome_id != gnome_id) entry_it++;
+
+		// make sure gnome was in the queue
+		assert(entry_it != req_queue.end());
+
+		// make sure gnome was in the window?
+		int idx = std::distance(req_queue.begin(), entry_it);
+		assert(idx < resource_cnt);
+
+		// make sure we sent ack to gnome:
+		assert(ack_sent.at(gnome_id) == true);
+		
+		
+		// action:
+		ack_sent[gnome_id] = false;
+		req_queue.erase(entry_it);
+		resource_cnt--;
+	}
+	
+	// PRODUCE resource -> possible 1 ack to send (enlarging the ack window)
+	// - increment cnt
+	// - check if <resource_cnt>-th index needs ack
+	void produce_resource(bool& should_send_ack, int &ack_gnome_id) {
+		resource_cnt++;
+		
+		if (resource_cnt < req_queue.size()) {
+			
+			auto entry_it = req_queue.begin();
+			std::advance(entry_it, resource_cnt);
+			
+			ack_gnome_id = entry_it->gnome_id;
+			should_send_ack = !(ack_sent.at(entry_it->gnome_id));
+		} else {
+			should_send_ack = false;
+		}
+	}
+	
+	void mark_ack_sent(int gnome_id) {
+		assert(ack_sent.at(gnome_id) == false);
+		ack_sent[gnome_id] = true;
+	}
 };
 
 struct GnomeMessage {
 	int message_type;
 	int resource_type; 
 	int lamport_timestamp;
-	int proc_id;
-	bool sent_ack; // did we already sent OK to process?
-};
-
-bool operator==(const GnomeMessage& lhs, const GnomeMessage& rhs) {
-	return (
-		lhs.message_type == rhs.message_type &&
-		lhs.resource_type == rhs.resource_type &&
-		lhs.lamport_timestamp == rhs.lamport_timestamp &&
-		lhs.proc_id == rhs.proc_id &&
-		lhs.sent_ack == rhs.sent_ack
-	);
-}
-
-struct GnomeMessageComparator {
-public:
-    bool operator() (const GnomeMessage& lhs, const GnomeMessage& rhs) const {
-		if (lhs.lamport_timestamp != rhs.lamport_timestamp) return lhs.lamport_timestamp < rhs.lamport_timestamp;
-		else return lhs.proc_id < rhs.proc_id;
-    }
 };
 
 class Gnome {
 	int tid = -1;
 	int type = GNOME_TYPE_NONE; 
-	int state = GNOME_STATE_RESTING;
+	int state = GNOME_STATE_NONE;
 	int lamport = 0; 
+	int req_resource = RESOURCE_TYPE_NONE;
 
 	std::vector<int> same_type_ids;
 	std::vector<int> other_type_ids;
-	std::vector<int> resources;
 
-	// TODO: must be per resource
-	std::vector<bool> ack_from_same_type;
-	std::set<GnomeMessage, GnomeMessageComparator> msg_set;
+	std::map<int, bool> received_ack;
+	int received_ack_cnt = 0;
+
+	std::map<int, GnomeResourceQueue> resource_queues;
+	std::array<int, GNOME_STATE_N> state_time; 
+
 	
 public:
-	Gnome(int g_tid, int g_type, const std::vector<int>& workers, const std::vector<int>& killers, const std::vector<int>& res_counts) {
+	Gnome(int g_tid, int g_type, const std::vector<int>& workers, const std::vector<int>& killers) {
 		tid = g_tid;
 		type = g_type;
-		state = GNOME_STATE_RESTING;
 		lamport = 0;
-		resources = res_counts;
+		state = GNOME_STATE_SLEEPING;
+		req_resource = RESOURCE_TYPE_NONE;
+		state_time = { 3, 1, 2, 3 };
 		
 		if (type == GNOME_TYPE_WORKER) {
 			same_type_ids = workers;
 			other_type_ids = killers;
-			ack_from_same_type.assign(workers.size(), false);
 		} else if (type == GNOME_TYPE_KILLER) {
 			same_type_ids = killers;
 			other_type_ids = workers;
-			ack_from_same_type.assign(killers.size(), false);
 		}
 		
+		clear_received_ack();
 	}
 	
-	void perform(bool requester = false, float req_interval_s = 5.0f) {
-		if (type == GNOME_TYPE_NONE) {
-			std::cout << get_debug_prefix() << "just none type, returning..." << std::endl;
+	void init_resources(const std::vector<std::pair<int, int>>& resources) {
+		for (auto p : resources) {
+			int r = p.first; 
+			int rc = p.second; 
+			resource_queues[r] = GnomeResourceQueue();
+			resource_queues[r].init(same_type_ids, rc);
+		}
+	}
+	
+	// can consume only one resource
+	bool all_gnomes_agreed() {
+		// all gnomes approved
+		return (received_ack_cnt == same_type_ids.size());
+	}
+	
+	void clear_received_ack() {
+		for (int id : same_type_ids) {
+			received_ack[id] = false;
+		}
+		received_ack_cnt = 0;
+	}
+
+	void act_as_worker() {
+		static auto last_transition = std::chrono::system_clock::now();
+		
+		auto current_time = std::chrono::system_clock::now();
+		auto elapsed = std::chrono::duration<float>(current_time - last_transition);
+		float seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+		// transition SLEEPING -> RESTING
+		if (state == GNOME_STATE_SLEEPING) {
+			// TODO: change
+			std::cerr << get_debug_prefix() << "Feeling sleepy... (going sleep for " << state_time[state] << " seconds)" << std::endl;
+			std::this_thread::sleep_for(std::chrono::seconds(state_time[state]));
+			state = GNOME_STATE_RESTING;
+		} else if (seconds < state_time[state]) {
+			// not ready yet
+			return;
+		}
+		// transition RESTING -> REQUESTING
+		else if (state == GNOME_STATE_RESTING) {
+			std::cerr << get_debug_prefix() << "Searching for pin! (waiting for ACKs)" << std::endl;
+			req_resource = RESOURCE_TYPE_PIN_SCOPE;
+
+			send_request_resource(req_resource);
+			state = GNOME_STATE_REQUESTING;
 		}
 		
-		std::cout << "Starting as requester: " << requester << std::endl;
-		auto last_start = std::chrono::system_clock::now();
+		// transition REQUESTING -> INSECTION
+		else if (state == GNOME_STATE_REQUESTING && all_gnomes_agreed()) {
+			std::cerr << get_debug_prefix() << "Assembling the next weapon of mass ratstruction! (using pins for next " 
+				<< state_time[GNOME_STATE_INSECTION] << " seconds)" << std::endl;
 
+			clear_received_ack();
+			send_consume_resource(req_resource);
+			state = GNOME_STATE_INSECTION;
+				
+			req_resource = RESOURCE_TYPE_NONE;
+		}
+		
+		// transition INSECTION -> SLEEPING 
+		else if (state == GNOME_STATE_INSECTION) {
+			std::cerr << get_debug_prefix() << "Finishing the weapon... (producing killers resources)" << std::endl;
+			
+			// TODO: make sure to send both after transition
+			send_produce_resource(RESOURCE_TYPE_PIN_SCOPE);
+			state = GNOME_STATE_SLEEPING;
+		}
+
+		last_transition = std::chrono::system_clock::now();
+	}
+
+	void act_as_killer() {
+		static auto last_transition = std::chrono::system_clock::now();
+		
+		auto current_time = std::chrono::system_clock::now();
+		auto elapsed = std::chrono::duration<float>(current_time - last_transition);
+		float seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+		// transition SLEEPING -> RESTING
+		if (state == GNOME_STATE_SLEEPING) {
+			// TODO: change
+			std::cerr << get_debug_prefix() << "Feeling sleepy... (going sleep for " << state_time[state] << " seconds)" << std::endl;
+			std::this_thread::sleep_for(std::chrono::seconds(state_time[state]));
+			state = GNOME_STATE_RESTING;
+		} else if (seconds < state_time[state]) {
+			// not ready yet
+			return;
+		}
+		// transition RESTING -> REQUESTING
+		else if (state == GNOME_STATE_RESTING) {
+			std::cerr << get_debug_prefix() << "I need weapon! (waiting for ACKs)" << std::endl;
+			req_resource = RESOURCE_TYPE_WEAPON;
+
+			send_request_resource(req_resource);
+			state = GNOME_STATE_REQUESTING;
+		}
+		
+		// transition REQUESTING -> INSECTION
+		else if (state == GNOME_STATE_REQUESTING && all_gnomes_agreed()) {
+			std::cerr << get_debug_prefix() << "Sending the next RAT to the moon, boyz! (using weapon for next " 
+				<< state_time[GNOME_STATE_INSECTION] << " seconds)" << std::endl;
+
+			clear_received_ack();
+			send_consume_resource(req_resource);
+			state = GNOME_STATE_INSECTION;
+				
+			req_resource = RESOURCE_TYPE_NONE;
+		}
+		
+		// transition INSECTION -> SLEEPING 
+		else if (state == GNOME_STATE_INSECTION) {
+			std::cerr << get_debug_prefix() << "Dissasembling weapon... (producing workers resources)" << std::endl;
+			
+			// TODO: make sure to send both after transition
+			send_produce_resource(RESOURCE_TYPE_PIN_SCOPE);
+			state = GNOME_STATE_SLEEPING;
+		}
+
+		last_transition = std::chrono::system_clock::now();
+	}
+
+	void perform() {
+		if (type == GNOME_TYPE_NONE) {
+			std::cout << get_debug_prefix() << "I am type NONE, returning..." << std::endl;
+			return;
+		}
+		
 		while (true) {
-			auto end = std::chrono::system_clock::now();
-			auto elapsed = std::chrono::duration<float>(end - last_start);
-			float seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
-
-
-			if (state == GNOME_STATE_RESTING && requester && seconds > req_interval_s) {
-				request_resource((GNOME_TYPE_KILLER ? RESOURCE_TYPE_GUN : RESOURCE_TYPE_PIN_SCOPE));
-				std::cerr << get_debug_prefix() << "starting REQUEST state!" << std::endl;
-				last_start = std::chrono::system_clock::now();
-			}
+			if (type == GNOME_TYPE_WORKER) act_as_worker();
+			else if (type == GNOME_TYPE_KILLER) act_as_killer();
 
 			MPI_Status status;
 			int probe_flag;
@@ -132,8 +337,8 @@ public:
 
 			int buffer[3]; // type, timestamp, resource
 			MPI_Recv(buffer, 3, MPI_INT, MPI_ANY_SOURCE, GNOME_MESSAGE_TAG, MPI_COMM_WORLD, &status);
-			GnomeMessage gm = { buffer[0], buffer[1], buffer[2], status.MPI_SOURCE, false };
-			react_to_message(gm);
+			GnomeMessage gm = { buffer[0], buffer[1], buffer[2] };
+			react_to_message(gm, status.MPI_SOURCE);
 		}
 	}
 private:
@@ -146,114 +351,48 @@ private:
 		iss << type_letter << "[" << tid << "] [t" << lamport << "]: ";
 		return iss.str();
 	}
-
-	void react_to_message(GnomeMessage gm) {
-		// TODO: check if needed
-		int old_lamport = lamport;
+	
+	void react_to_message(GnomeMessage gm, int src_gnome_id) {
 		lamport = std::max(gm.lamport_timestamp, lamport) + 1;
-
+		
+		// if (src_gnome_id == tid) std::cerr << get_debug_prefix() << "received from myself! " << gm.message_type << std::endl;
+		
+		auto& queue = resource_queues[gm.resource_type];
+		bool should_send_ack = false;
+		int gnome_id = -1;
+		
 		switch (gm.message_type) {
-			case MESSAGE_TYPE_REQUEST: {
-				if (type == GNOME_TYPE_KILLER) {
-					resources[gm.resource_type]--;
-				} 
-				// Send ACK only if currently in position queue in first <resource_cnt> positions
-				// - mark "ACK sent" flag
-
-				auto gm_it = msg_set.upper_bound(gm);
-				int idx = std::distance(msg_set.begin(), gm_it);
-				
-				// if we believe that resource is obtainable, sent ACK
-				assert(resources.size() > gm.resource_type);
-
-				if (idx <= resources[gm.resource_type]) {
-					std::cerr << get_debug_prefix() << "I think " << gm.proc_id << " will be now " << idx << " in my queue, so I send ACK" << std::endl;
-					send_ack(gm.proc_id, gm.resource_type);
-					gm.sent_ack = true;
-				}  
-
-				// assume process sends 1 request, waits for ACK
-				msg_set.insert(gm);
+			case MESSAGE_TYPE_PRODUCE: {
+				queue.produce_resource(should_send_ack, gnome_id);
 			} break;
-			case MESSAGE_TYPE_RELEASE: {
-				// Check if we can send "ACK" for elements in queue, after deleting first
-				// TODO: type can be renewable? 
-				if (type == GNOME_TYPE_KILLER) {
-					resources[gm.resource_type]++;
-				} 
-				
-				if (!msg_set.empty()) {
-					// TODO: send ACK if not sent?
-					// 
-
-					auto first_it = msg_set.begin();
-					
-					bool sent_ack = false;
-					if (!first_it->sent_ack) {
-						send_ack(first_it->proc_id, first_it->resource_type);
-						sent_ack = true;
-					}
-
-					msg_set.erase(first_it);
-					std::cerr << get_debug_prefix() << "Received RELEASE from other group: erasing (" << gm.proc_id << ", " << gm.lamport_timestamp << ") - sent_ack? " << sent_ack << std::endl;
-				} else {
-					std::cerr << get_debug_prefix() << "Received RELEASE from other group: but set empty []" << std::endl;
-				}
-
-				
-				// check for not sent last <resource_cnt> element 
-				// - we erased first element -> check for next in "Window"
-				// 
-				if (msg_set.size()) {
-					auto it = msg_set.begin();
-					std::advance(it, resources[gm.resource_type]);
-					if (it != msg_set.end() && !it->sent_ack) {
-						GnomeMessage gm_copy = *(it);
-						gm_copy.sent_ack = true;
-						
-						std::cerr << get_debug_prefix() << "RELEASE free, so Sending ACK to " << gm_copy.proc_id << ", " << gm_copy.lamport_timestamp << std::endl;
-						send_ack(gm_copy.proc_id, gm.resource_type);
-						
-						msg_set.erase(it);
-						msg_set.insert(gm_copy);
-					}
-
-				}
+			case MESSAGE_TYPE_CONSUME: {
+				queue.consume_resource(src_gnome_id, gm.lamport_timestamp);
+			} break;
+			case MESSAGE_TYPE_REQUEST: {
+				queue.add_request(src_gnome_id, gm.lamport_timestamp, should_send_ack, gnome_id);
 			} break;
 			case MESSAGE_TYPE_ACK: {
-				std::cout << get_debug_prefix() << "Received ACK from " << gm.proc_id << std::endl;
-				
-				int idx = std::distance(same_type_ids.begin(), std::find(same_type_ids.begin(), same_type_ids.end(), gm.proc_id));
-				assert(ack_from_same_type[idx] == false);
-				ack_from_same_type[idx] = true;
-				
-				if (std::all_of(ack_from_same_type.begin(), ack_from_same_type.end(), [](bool x){ return x; })) {
-					std::cout << get_debug_prefix() << "ALL ACK Combined! -> Clearing and sending releases " << gm.proc_id << std::endl;
-					state = GNOME_STATE_RESTING;
-					std::fill(ack_from_same_type.begin(), ack_from_same_type.end(), false);
-					// combined resource, send new GUN resource
-					// TODO: make sure sending ALL new resources
-					
-					if (type == GNOME_TYPE_WORKER) {
-						release_resource(RESOURCE_TYPE_GUN);
-					} else if (type == GNOME_TYPE_KILLER) {
-						release_resource(RESOURCE_TYPE_PIN_SCOPE);
-					}
-				}
-				
+				assert(received_ack[src_gnome_id] == false);
+				received_ack[src_gnome_id] = true;
+				received_ack_cnt++;
 			} break;
 		}
-	} 
+
+		if (should_send_ack) {
+			send_ack_resource(gnome_id, gm.resource_type);
+			queue.mark_ack_sent(gnome_id);
+		}
+	}
 	
-	void send_ack(int gnome_id, int resource) {
+	
+	void send_ack_resource(int gnome_id, int resource) {
 		lamport++;
 		int buffer[3] = { MESSAGE_TYPE_ACK, resource, lamport };
 		MPI_Send(buffer, 3, MPI_INT, gnome_id, GNOME_MESSAGE_TAG, MPI_COMM_WORLD);
 	}
 	
-	void request_resource(int resource) {
+	void send_request_resource(int resource) {
 		// If I am worker/killer -> broadcast message to all workers/killers that I want to take resource
-		state = GNOME_STATE_REQUESTING;
 		lamport++;
 		int buffer[3] = { MESSAGE_TYPE_REQUEST, resource, lamport };
 		for (auto gnome_id : same_type_ids) {
@@ -261,14 +400,23 @@ private:
 		}
 	}
 
-	void release_resource(int resource) {
+	void send_consume_resource(int resource) {
 		// If I am worker/killer -> broadcast message to all killers/workers that I want released resource
 		lamport++;
-		int buffer[3] = { MESSAGE_TYPE_RELEASE, resource, lamport };
+		int buffer[3] = { MESSAGE_TYPE_CONSUME, resource, lamport };
+		for (auto gnome_id : same_type_ids) {
+			MPI_Send(buffer, 3, MPI_INT, gnome_id, GNOME_MESSAGE_TAG, MPI_COMM_WORLD);
+		}
+	}
+	
+	void send_produce_resource(int resource) {
+		lamport++;
+		int buffer[3] = { MESSAGE_TYPE_PRODUCE, resource, lamport };
 		for (auto gnome_id : other_type_ids) {
 			MPI_Send(buffer, 3, MPI_INT, gnome_id, GNOME_MESSAGE_TAG, MPI_COMM_WORLD);
 		}
 	}
+
 };
 
 
@@ -280,10 +428,12 @@ int assign_gnome_roles(std::vector<int>& workers, std::vector<int>& killers, int
 	// + fill vectors with ids of other gnomes
 	
 	for (int i = 0; i < n_workers; i++) {
-		if (i != my_tid) workers.push_back(i);
+		// if (i != my_tid) 
+		workers.push_back(i);
 	}
 	for (int i = n_workers; i < n_workers + n_killers; i++) {
-		if (i != my_tid) killers.push_back(i);
+		// if (i != my_tid) 
+		killers.push_back(i);
 	}
 
 	if (my_tid < n_workers) {
@@ -317,14 +467,19 @@ int main(int argc, char **argv) {
 	int my_type = assign_gnome_roles(workers, killers, n_workers, n_killers, tid);
 	
 	// TODO: change resources to both Pins and Scopes
-	std::vector<int> resources { N_SCOPES, 0 };
 	
-	Gnome gnome(tid, my_type, workers, killers, resources);
-	if (tid == 0 || tid == 2) {
-		gnome.perform(true);
-	} else {
-		gnome.perform();
+	Gnome gnome(tid, my_type, workers, killers) ;
+	std::vector<std::pair<int, int>> resources;
+
+	if (my_type == GNOME_TYPE_KILLER) {
+		resources.push_back({RESOURCE_TYPE_WEAPON, 1});
+	} else if (my_type == GNOME_TYPE_WORKER) {
+		resources.push_back({RESOURCE_TYPE_PIN_SCOPE, N_PINS});
+		// TODO: Add second resource
 	}
+	
+	gnome.init_resources(resources);
+	gnome.perform();
 
 	MPI_Finalize(); // Musi być w każdym programie na końcu
 }
