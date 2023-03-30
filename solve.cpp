@@ -75,6 +75,20 @@ class GnomeResourceQueue {
 	std::set<GnomeQueueEntry, GnomeQueueEntryComparator> req_queue;
 public:
 	
+	std::string get_debug_info() {
+		std::stringstream ss;
+		ss << "GnomeResourceQueue{" << resource_cnt << " res; q=[";
+		for (GnomeQueueEntry entry : req_queue) {
+			ss << "(" << entry.gnome_id << "," << entry.lamport_timestamp << "), ";
+		}
+		ss << "]; acks: ["; 
+		for (auto p : ack_sent) {
+			ss << "(" << p.first << ", " << p.second << "), ";
+		}
+		ss << "]}";
+		return ss.str();
+	}
+	
 	void init(const std::vector<int>& gnome_ids, int n_resources) {
 		resource_cnt = n_resources;
 		for (auto id : gnome_ids) {
@@ -135,9 +149,7 @@ public:
 	// - check if <resource_cnt>-th index needs ack
 	void produce_resource(bool& should_send_ack, int &ack_gnome_id) {
 		resource_cnt++;
-		
-		if (resource_cnt < req_queue.size()) {
-			
+		if (resource_cnt < req_queue.size() + 1) {
 			auto entry_it = req_queue.begin();
 			std::advance(entry_it, resource_cnt);
 			
@@ -247,8 +259,9 @@ public:
 		
 		// transition REQUESTING -> INSECTION
 		else if (state == GNOME_STATE_REQUESTING && all_gnomes_agreed()) {
+			auto& q = resource_queues[req_resource];
 			std::cerr << get_debug_prefix() << "Assembling the next weapon of mass ratstruction! (using pins for next " 
-				<< state_time[GNOME_STATE_INSECTION] << " seconds)" << std::endl;
+				<< state_time[GNOME_STATE_INSECTION] << " seconds) because all gnomes: " << all_gnomes_agreed() << " - " << q.get_debug_info() << std::endl;
 
 			clear_received_ack();
 			send_consume_resource(req_resource);
@@ -262,7 +275,7 @@ public:
 			std::cerr << get_debug_prefix() << "Finishing the weapon... (producing killers resources)" << std::endl;
 			
 			// TODO: make sure to send both after transition
-			send_produce_resource(RESOURCE_TYPE_PIN_SCOPE);
+			send_produce_resource(RESOURCE_TYPE_WEAPON);
 			state = GNOME_STATE_SLEEPING;
 		}
 
@@ -364,12 +377,15 @@ private:
 		switch (gm.message_type) {
 			case MESSAGE_TYPE_PRODUCE: {
 				queue.produce_resource(should_send_ack, gnome_id);
+				std::cerr << get_debug_prefix() << "...received PRODUCE from " << src_gnome_id << "(something new: " << should_send_ack << ")" << std::endl;
 			} break;
 			case MESSAGE_TYPE_CONSUME: {
+				std::cerr << get_debug_prefix() << "...received CONSUME from " << src_gnome_id << ", -> " << queue.get_debug_info() << std::endl;
 				queue.consume_resource(src_gnome_id, gm.lamport_timestamp);
 			} break;
 			case MESSAGE_TYPE_REQUEST: {
 				queue.add_request(src_gnome_id, gm.lamport_timestamp, should_send_ack, gnome_id);
+				std::cerr << get_debug_prefix() << "...received REQUEST from " << src_gnome_id << "(should send? " << should_send_ack << ", " << gnome_id << ")" << std::endl;
 			} break;
 			case MESSAGE_TYPE_ACK: {
 				assert(received_ack[src_gnome_id] == false);
