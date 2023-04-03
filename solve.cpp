@@ -15,10 +15,10 @@
 #include <map>
 
 // TODO: move to arguments 
-#define N_WORKERS 	5
-#define N_KILLERS 	1
-#define N_PINS 		1 
-#define N_SCOPES 	1 
+#define N_WORKERS 	3
+#define N_HUNTERS 	1
+#define N_PINS 		5 
+#define N_SCOPES 	5 
 #define N_WEAPONS 	0 
 
 #define RANDOMIZE_STATE_TIMES 1
@@ -50,15 +50,17 @@ enum {
 	GNOME_STATE_SLEEPING,
 	GNOME_STATE_RESTING,
 	GNOME_STATE_REQUESTING, 
-	GNOME_STATE_INSECTION,
+	GNOME_STATE_WORKING,
 	GNOME_STATE_N,
 };
 
 enum {
 	GNOME_TYPE_NONE = -1,
 	GNOME_TYPE_WORKER,
-	GNOME_TYPE_KILLER,
+	GNOME_TYPE_HUNTER,
 };
+
+int DEFAULT_STATE_TIMES[GNOME_STATE_N] = { 1, 2, 3, 4 };
 
 
 // Assumes one resource
@@ -101,7 +103,7 @@ public:
 
 	// REQUEST received -> possible sending ACK 
 	// - check if entry is in ack window [0, <resource_cnt>)
-	// - * if yes: mark send ack
+	// - * if yes: return true  ack
 	bool add_request(int gnome_id, int lamport) {
 		GnomeQueueEntry entry = { gnome_id, lamport };
 
@@ -196,20 +198,22 @@ class Gnome {
 
 	
 public:
-	Gnome(int g_tid, int g_type, const std::vector<int>& workers, const std::vector<int>& killers) {
+	Gnome(int g_tid, int g_type, const std::vector<int>& workers, const std::vector<int>& hunters) {
 		tid = g_tid;
 		type = g_type;
 		lamport = 0;
 		state = GNOME_STATE_SLEEPING;
 		req_resource = RESOURCE_TYPE_NONE;
-		state_time = { 3, 5, 2, 3 };
 		ack_myself = false;
+
+		// state_time = DEFAULT_STATE_TIMES
+		std::move(std::begin(DEFAULT_STATE_TIMES), std::end(DEFAULT_STATE_TIMES), state_time.begin());
 		
 		if (type == GNOME_TYPE_WORKER) {
 			same_type_ids = workers;
-			other_type_ids = killers;
-		} else if (type == GNOME_TYPE_KILLER) {
-			same_type_ids = killers;
+			other_type_ids = hunters;
+		} else if (type == GNOME_TYPE_HUNTER) {
+			same_type_ids = hunters;
 			other_type_ids = workers;
 		}
 		
@@ -274,17 +278,17 @@ public:
 			state = GNOME_STATE_REQUESTING;
 		}
 		
-		// transition REQUESTING -> INSECTION
+		// transition REQUESTING -> WORKING
 		else if (state == GNOME_STATE_REQUESTING && all_gnomes_agreed()) {
 			auto& q = resource_queues[req_resource];
-			// std::cerr << get_debug_prefix() << "Assembling the next weapon of mass ratstruction! (using pins for next " << state_time[GNOME_STATE_INSECTION] << " seconds) because all gnomes: " << all_gnomes_agreed() << " - " << q.get_debug_info() << std::endl;
+			// std::cerr << get_debug_prefix() << "Assembling the next weapon of mass ratstruction! (using pins for next " << state_time[GNOME_STATE_WORKING] << " seconds) because all gnomes: " << all_gnomes_agreed() << " - " << q.get_debug_info() << std::endl;
 
-			state = GNOME_STATE_INSECTION;
+			state = GNOME_STATE_WORKING;
 			std::cerr << get_debug_prefix() << "Assembing the weapon of mass ratstruction! (REQ -> WORK) {" << state_time[state] << "s}" << std::endl;
 		}
 		
-		// transition INSECTION -> SLEEPING 
-		else if (state == GNOME_STATE_INSECTION) {
+		// transition WORKING -> SLEEPING 
+		else if (state == GNOME_STATE_WORKING) {
 			std::cerr << get_debug_prefix() << "Delivering the weapon... (WORK -> SLEEP)" << std::endl;
 			
 			clear_received_ack();
@@ -305,11 +309,11 @@ public:
 	// Set state times to random values
 	void roll_state_times(int min_time_s = RANDOM_MIN_TIME_S, int max_time_s = RANDOM_MAX_TIME_S) {
 		for (int &time_s : state_time) {
-			time_s = rand() % (max_time_s - min_time_s) + min_time_s;
+			time_s = rand() % (max_time_s - min_time_s + 1) + min_time_s;
 		}
 	}
 
-	void act_as_killer() {
+	void act_as_hunter() {
 		static auto last_transition = std::chrono::system_clock::now();
 		
 		auto current_time = std::chrono::system_clock::now();
@@ -345,14 +349,14 @@ public:
 			state = GNOME_STATE_REQUESTING;
 		}
 		
-		// transition REQUESTING -> INSECTION
+		// transition REQUESTING -> WORKING
 		else if (state == GNOME_STATE_REQUESTING && all_gnomes_agreed()) {
-			state = GNOME_STATE_INSECTION;
+			state = GNOME_STATE_WORKING;
 			std::cerr << get_debug_prefix() << "Sending the next RAT to the moon, boyz! (REQ -> WORK) {" << state_time[state] <<"s}" << std::endl;
 		}
 		
-		// transition INSECTION -> SLEEPING 
-		else if (state == GNOME_STATE_INSECTION) {
+		// transition WORKING -> SLEEPING 
+		else if (state == GNOME_STATE_WORKING) {
 			std::cerr << get_debug_prefix() << "Headhunterz are back... (WORK -> SLEEP)" << std::endl;
 			
 			// TODO: make sure to send both after transition
@@ -379,7 +383,7 @@ public:
 			if (RANDOMIZE_STATE_TIMES) roll_state_times();
 
 			if (type == GNOME_TYPE_WORKER) act_as_worker();
-			else if (type == GNOME_TYPE_KILLER) act_as_killer();
+			else if (type == GNOME_TYPE_HUNTER) act_as_hunter();
 
 
 			// probe messages in mpi -> non-blocking
@@ -403,7 +407,7 @@ private:
 		std::stringstream iss;
 		char type_letter = '?';
 		if (type == GNOME_TYPE_WORKER) type_letter = 'W';
-		else if (type == GNOME_TYPE_KILLER) type_letter = 'K';
+		else if (type == GNOME_TYPE_HUNTER) type_letter = 'H';
 		iss << type_letter << "[" << tid << "] [t" << lamport << "]: ";
 		return iss.str();
 	}
@@ -466,7 +470,7 @@ private:
 	}
 	
 	void send_request_resource(int resource) {
-		// If I am worker/killer -> broadcast message to all workers/killers that I want to take resource
+		// If I am worker/hunter -> broadcast message to all workers/hunters that I want to take resource
 		int buffer[3] = { MESSAGE_TYPE_REQUEST, resource, lamport };
 		for (auto gnome_id : same_type_ids) {
 			MPI_Send(buffer, 3, MPI_INT, gnome_id, GNOME_MESSAGE_TAG, MPI_COMM_WORLD);
@@ -476,7 +480,7 @@ private:
 	}
 
 	void send_consume_resource(int resource) {
-		// If I am worker/killer -> broadcast message to all killers/workers that I want released resource
+		// If I am worker/hunter -> broadcast message to all hunters/workers that I want released resource
 		int buffer[3] = { MESSAGE_TYPE_CONSUME, resource, lamport };
 		for (auto gnome_id : same_type_ids) {
 			MPI_Send(buffer, 3, MPI_INT, gnome_id, GNOME_MESSAGE_TAG, MPI_COMM_WORLD);
@@ -495,24 +499,24 @@ private:
 };
 
 
-int assign_gnome_roles(std::vector<int>& workers, std::vector<int>& killers, int n_workers, int n_killers, int my_tid) {
+int assign_gnome_roles(std::vector<int>& workers, std::vector<int>& hunters, int n_workers, int n_hunters, int my_tid) {
 	// Return my Gnome Role 
 	// tid in [0 : n_workers) -> gnome worker
-	// tid in [n_workers : n_workers + n_killers) -> gnome killer
-	// tid in [n_workers + n_killers : ...)  -> none
+	// tid in [n_workers : n_workers + n_hunters) -> gnome hunter
+	// tid in [n_workers + n_hunters : ...)  -> none
 	// + fill vectors with ids of other gnomes
 	
 	for (int i = 0; i < n_workers; i++) {
 		if (i != my_tid) workers.push_back(i);
 	}
-	for (int i = n_workers; i < n_workers + n_killers; i++) {
-		 if (i != my_tid) killers.push_back(i);
+	for (int i = n_workers; i < n_workers + n_hunters; i++) {
+		 if (i != my_tid) hunters.push_back(i);
 	}
 
 	if (my_tid < n_workers) {
 		return GNOME_TYPE_WORKER;
-	} else if (my_tid < n_workers + n_killers) {
-		return GNOME_TYPE_KILLER;
+	} else if (my_tid < n_workers + n_hunters) {
+		return GNOME_TYPE_HUNTER;
 	} else {
 		return GNOME_TYPE_NONE;
 	}
@@ -532,22 +536,22 @@ int main(int argc, char **argv) {
 	srand(time(0) + tid);
 	// printf("My id is %d from %d\n",tid, size);
 	
-	// We can pass maximums for both workers and killers
+	// We can pass maximums for both workers and hunters
 	// - if possible we try to get all workers
-	// - we try to assign what left to killers
+	// - we try to assign what left to hunters
 	int n_workers = std::min(N_WORKERS, size);
-	int n_killers = std::min(size - n_workers, N_KILLERS);
+	int n_hunters = std::min(size - n_workers, N_HUNTERS);
 	
 	std::vector<int> workers;
-	std::vector<int> killers;
-	int my_type = assign_gnome_roles(workers, killers, n_workers, n_killers, tid);
+	std::vector<int> hunters;
+	int my_type = assign_gnome_roles(workers, hunters, n_workers, n_hunters, tid);
 	
 	// TODO: change resources to both Pins and Scopes
 	
-	Gnome gnome(tid, my_type, workers, killers) ;
+	Gnome gnome(tid, my_type, workers, hunters) ;
 	std::vector<std::pair<int, int>> resources;
 
-	if (my_type == GNOME_TYPE_KILLER) {
+	if (my_type == GNOME_TYPE_HUNTER) {
 		resources.push_back({RESOURCE_TYPE_WEAPON, N_WEAPONS});
 	} else if (my_type == GNOME_TYPE_WORKER) {
 		resources.push_back({RESOURCE_TYPE_PIN_SCOPE, std::min(N_PINS, N_SCOPES)});
